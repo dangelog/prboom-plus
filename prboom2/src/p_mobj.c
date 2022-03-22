@@ -52,6 +52,8 @@
 #include "g_overflow.h"
 #include "e6y.h"//e6y
 
+#include <math.h>
+
 // [FG] colored blood and gibs
 dboolean colored_blood;
 
@@ -1563,6 +1565,162 @@ void P_CheckMissileSpawn (mobj_t* th)
     P_ExplodeMissile (th);
 }
 
+#define SHARPSHOOTER
+//#define DEBUG_SHARPSHOOTER
+
+#ifdef SHARPSHOOTER
+
+//
+// P_SharpShooter
+// Adjustes target_X and target_Y to make source shoot
+//  a projectile there (taking into account dest's momentum
+//  and the speed of the projectile)
+//
+
+static void P_SharpShooter (mobj_t* source,mobj_t* dest,int projectile_speed,fixed_t *target_X,fixed_t *target_Y)
+{
+  // Basic idea is: source shoots projectile at constant speed.
+  // the points that can be reached by the projectile can be modeled
+  // with a circle centered at the source, whose radius grows over time.
+  // Destination also moves at a "constant speed", approximated
+  // by a straight line.
+  // In formula, given
+  // * s = source position vector
+  // * p = projectile speed
+  // * d = dest position vector
+  // * v = dest velocity vector
+  // then we are looking to solve for t (= time) this equation:
+  //
+  // || d + v*t - s || = p*t
+  //
+  // Where || is distance (norm 2). Squaring both sides, and using
+  // the fact that dot(a, a) == ||a||^2:
+  //
+  // dot(d + v*t - s, d + v*t - s) = p^2 * t^2
+  //
+  // Unrolling the first term:
+  //
+  // dot(d, d) + t*dot(d, v) -dot(d, s)
+  //  + t*dot(d, v) + t^2*dot(v, v) -t*dot(v, s)
+  //  - dot(d, s) -t*dot(v, s) + dot(s, s) = p^2 * t^2
+  //
+  // Rearranging:
+  //
+  // dot(d, d) - 2*dot(d, s) + dot(s, s)
+  //  + 2*t*dot(d, v) - 2*t*dot(v, s)
+  //  + t^2*dot(v, v) = p^2 * t^2
+  //
+  // Using a replacement X = d - s, then this can be streamlined as:
+  //
+  // dot(X, X) + 2 * t * dot(X, v) + t^2 * dot(v, v) = p^2 * t^2
+  //
+  // And finally rearranging as a quadratic in t:
+  //
+  // (dot(v, v) - p^2) * t^2 + 2 * dot(X, v) * t + dot(X, X) = 0
+  // \------ A ------/         \--- B -----/       \-- C --/
+  //
+  // Solve for `t`, and use it together with d and v to determine where
+  // the destination will be when the projectile lands. Shoot there!
+
+#ifdef DEBUG_SHARPSHOOTER
+#define FORMAT(x) (x >> FRACBITS)
+#define PRINT_SHARP printf
+#else
+#define FORMAT(x)
+#define PRINT_SHARP(...)
+#endif
+
+  // This stuff tends to overflow quite quickly, so using double.
+  // Could possibly be redone by other means.
+  double X_x = FixedToDouble(dest->x - source->x);
+  double X_y = FixedToDouble(dest->y - source->y);
+
+  double v_dot_v = pow(FixedToDouble(dest->momx), 2) + pow(FixedToDouble(dest->momy), 2);
+  projectile_speed /= FRACUNIT;  // FIXME, does the division make sense? What's momx/momy units?
+  if (projectile_speed <= 20) // HACK to "force" a solution with projectiles slower than the target
+    projectile_speed = 20;
+  double p_square = pow(projectile_speed, 2);
+  double A = v_dot_v - p_square;
+
+  double X_dot_v = X_x * FixedToDouble(dest->momx) + X_y * FixedToDouble(dest->momy);
+  double B = 2 * X_dot_v;
+
+  double X_dot_X = X_x * X_x + X_y * X_y;
+  double C = X_dot_X;
+
+  double B_square = B * B;
+  double discriminant = B_square - 4 * A * C;
+
+  PRINT_SHARP("Source: (%d,%d), Destination (%d,%d)\n", FORMAT(source->x), FORMAT(source->y), FORMAT(dest->x), FORMAT(dest->y));
+  PRINT_SHARP("  X(%f,%f)\n", X_x, X_y);
+  PRINT_SHARP("  p(%d)\n", projectile_speed);
+  PRINT_SHARP("  A=%f, B=%f, C=%f\n", A, B, C);
+  PRINT_SHARP("  delta=%f\n", discriminant);
+
+  if (discriminant >= 0)
+    {
+    // There is a solution
+    double discriminant_root = sqrt(discriminant);
+    double sol1 = (-B + discriminant_root) / (2 * A);
+    double sol2 = (-B - discriminant_root) / (2 * A);
+    PRINT_SHARP("  sol1=%f ; sol2=%f\n", sol1, sol2);
+
+    if (sol1 > 0 || sol2 > 0)
+    {
+      double solution = MIN(sol1, sol2);
+      if (solution < 0)
+        solution = sol2;
+
+      double scaled_solution = solution;
+
+      // Avoid making *everything* a sniper
+      switch (source->type)
+      {
+      case MT_CYBORG:
+      case MT_BRUISER:
+        // snipers, exact solution
+        break;
+
+      case MT_FATSO:
+      case MT_HEAD:
+      case MT_PAIN:
+      case MT_KNIGHT:
+      case MT_UNDEAD:
+      case MT_BABY:
+        {
+          int rand = P_Random(pr_sharpshooter);
+
+          // shoot "around" the target area
+          // map rand to [0.5, 1.0)
+          double scale = rand / 256.0 / 2.0 + 0.5;
+          scaled_solution = solution * scale;
+        }
+        break;
+
+      case MT_TROOP:
+      default:
+        {
+          // meh, just try something
+          scaled_solution = solution / 2;
+        }
+      }
+
+      PRINT_SHARP("  solution=%f,sol=%f\n", solution, scaled_solution);
+
+      // TODO: check if we can see the target, if not, shoot somewhere else
+      fixed_t sol = DoubleToFixed(scaled_solution);
+      *target_X = dest->x + FixedMul(dest->momx, sol);
+      *target_Y = dest->y + FixedMul(dest->momy, sol);
+    }
+  }
+#ifdef DEBUG_SHARPSHOOTER
+#undef FORMAT
+#undef PRINT_SHARP
+#endif
+}
+
+#endif // SHARPSHOOTER
+
 
 //
 // P_SpawnMissile
@@ -1573,6 +1731,8 @@ mobj_t* P_SpawnMissile(mobj_t* source,mobj_t* dest,mobjtype_t type)
   mobj_t* th;
   angle_t an;
   int     dist;
+  fixed_t target_X = dest->x;
+  fixed_t target_Y = dest->y;
 
   th = P_SpawnMobj (source->x,source->y,source->z + 4*8*FRACUNIT,type);
 
@@ -1580,7 +1740,12 @@ mobj_t* P_SpawnMissile(mobj_t* source,mobj_t* dest,mobjtype_t type)
     S_StartSound (th, th->info->seesound);
 
   P_SetTarget(&th->target, source);    // where it came from
-  an = R_PointToAngle2 (source->x, source->y, dest->x, dest->y);
+
+#ifdef SHARPSHOOTER
+  P_SharpShooter(source, dest, th->info->speed, &target_X, &target_Y);
+#endif
+  an = R_PointToAngle2 (source->x, source->y, target_X, target_Y);
+
 
   // fuzzy player
 

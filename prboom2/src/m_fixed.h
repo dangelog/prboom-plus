@@ -121,4 +121,17 @@ static CONSTFUNC fixed_t Scale(fixed_t a, fixed_t b, fixed_t c)
 	return (fixed_t)(((int_64_t)a*b)/c);
 }
 
+inline static CONSTFUNC double FixedToDouble(fixed_t v)
+{
+    double d = v;
+    d /= (1 << FRACBITS);
+    return d;
+}
+
+inline static CONSTFUNC fixed_t DoubleToFixed(double d)
+{
+    d *= (1 << FRACBITS);
+    return (fixed_t)d;
+}
+
 #endif
